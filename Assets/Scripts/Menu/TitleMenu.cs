@@ -1,101 +1,25 @@
-// MYSTIC KOMBAT - Title menu for Unity.
-// ZERO SETUP: this script creates the whole menu by itself when you press Play,
-// in any scene. No GameObjects to add, nothing to drag in the Inspector.
-//
-// Works with both the new Input System and the old Input Manager.
+// Title menu and in-battle pause menu. Builds its own UI at runtime, so nothing needs
+// to be added to the scene. Works with both the new Input System and the old Input Manager.
 
 using System.Collections;
+using System.Reflection;
 using UnityEngine;
 using UnityEngine.UI;
-#if ENABLE_INPUT_SYSTEM
-using UnityEngine.InputSystem;
-#endif
 
 namespace MysticKombat
 {
-    // ---------------------------------------------------------------- input
-    static class MenuInput
-    {
-        public static bool Up()
-        {
-#if ENABLE_INPUT_SYSTEM
-            var k = Keyboard.current;
-            return k != null && (k.upArrowKey.wasPressedThisFrame || k.wKey.wasPressedThisFrame);
-#elif ENABLE_LEGACY_INPUT_MANAGER
-            return Input.GetKeyDown(KeyCode.UpArrow) || Input.GetKeyDown(KeyCode.W);
-#else
-            return false;
-#endif
-        }
-
-        public static bool Down()
-        {
-#if ENABLE_INPUT_SYSTEM
-            var k = Keyboard.current;
-            return k != null && (k.downArrowKey.wasPressedThisFrame || k.sKey.wasPressedThisFrame);
-#elif ENABLE_LEGACY_INPUT_MANAGER
-            return Input.GetKeyDown(KeyCode.DownArrow) || Input.GetKeyDown(KeyCode.S);
-#else
-            return false;
-#endif
-        }
-
-        public static bool Confirm()
-        {
-#if ENABLE_INPUT_SYSTEM
-            var k = Keyboard.current;
-            return k != null && (k.enterKey.wasPressedThisFrame || k.numpadEnterKey.wasPressedThisFrame || k.spaceKey.wasPressedThisFrame);
-#elif ENABLE_LEGACY_INPUT_MANAGER
-            return Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(KeyCode.KeypadEnter) || Input.GetKeyDown(KeyCode.Space);
-#else
-            return false;
-#endif
-        }
-
-        public static bool Back()
-        {
-#if ENABLE_INPUT_SYSTEM
-            var k = Keyboard.current;
-            return k != null && k.escapeKey.wasPressedThisFrame;
-#elif ENABLE_LEGACY_INPUT_MANAGER
-            return Input.GetKeyDown(KeyCode.Escape);
-#else
-            return false;
-#endif
-        }
-
-        public static Vector2 MousePos()
-        {
-#if ENABLE_INPUT_SYSTEM
-            var m = Mouse.current;
-            return m != null ? m.position.ReadValue() : Vector2.zero;
-#elif ENABLE_LEGACY_INPUT_MANAGER
-            return Input.mousePosition;
-#else
-            return Vector2.zero;
-#endif
-        }
-
-        public static bool Click()
-        {
-#if ENABLE_INPUT_SYSTEM
-            var m = Mouse.current;
-            return m != null && m.leftButton.wasPressedThisFrame;
-#elif ENABLE_LEGACY_INPUT_MANAGER
-            return Input.GetMouseButtonDown(0);
-#else
-            return false;
-#endif
-        }
-    }
-
-    // ----------------------------------------------------------------- menu
     public class TitleMenu : MonoBehaviour
     {
         static TitleMenu instance;
 
-        // Edit these to rename / reorder options.
+        // True while the in-battle pause menu is open (BattleScene freezes itself while this is set).
+        public static bool IsPaused { get { return instance != null && instance.pauseOpen; } }
+
         static readonly string[] Labels = { "1 PLAYER", "2 PLAYERS", "CONTROLS", "QUIT" };
+        static readonly string[] PauseLabels = { "OPTIONS", "EXIT" };
+
+        // Top-middle pause button vertical offset from top edge (in line with health bars)
+        const float PauseButtonY = -55f;
 
         class Item
         {
@@ -107,7 +31,6 @@ namespace MysticKombat
             public float t, punch, flash, baseY;
         }
 
-        // colours
         static readonly Color Gold = new Color(1f, 0.82f, 0.30f, 1f);
         static readonly Color GoldLight = new Color(1f, 0.93f, 0.55f, 1f);
         static readonly Color GoldText = new Color(1f, 0.89f, 0.48f, 1f);
@@ -117,6 +40,7 @@ namespace MysticKombat
 
         Font font;
         RectTransform root, titleRt, bgRt, controlsPanel;
+        RectTransform hudRoot, pausePanel;
         RawImage bgImage;
         Outline titleGlow;
         Image fade;
@@ -125,12 +49,14 @@ namespace MysticKombat
         AudioClip sndMove, sndConfirm;
 
         readonly Item[] items = new Item[Labels.Length];
-        int selected;
+        readonly Item[] pauseItems = new Item[PauseLabels.Length];
+        Item pauseTopBtn;
+
+        int selected, pauseSelected;
         float clock, toastT, glitchT, lastScreenAspect;
-        bool busy, controlsOpen;
+        bool busy, controlsOpen, inBattle, pauseOpen;
         Vector2 lastMouse;
 
-        // ------------------------------------------------------------ boot
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         static void Boot()
         {
@@ -159,10 +85,10 @@ namespace MysticKombat
             sfx.playOnAwake = false;
             sfx.spatialBlend = 0f;
             BuildUI();
+            BuildPauseUI();
             lastMouse = MenuInput.MousePos();
         }
 
-        // -------------------------------------------------------- helpers
         static Font MakeFont()
         {
             Font f = null;
@@ -202,6 +128,45 @@ namespace MysticKombat
             return t;
         }
 
+        Item CreateStyledButton(string labelText, Transform parent, Vector2 size, float baseY, int fontSize = 46, bool showArrows = true)
+        {
+            var it = new Item();
+            it.baseY = baseY;
+            it.rt = NewRect("Btn_" + labelText, parent);
+            it.rt.sizeDelta = size;
+            it.rt.anchoredPosition = new Vector2(0, baseY);
+            it.bg = it.rt.gameObject.AddComponent<Image>();
+            it.bg.color = new Color(0, 0, 0, 0.65f);
+            it.bg.raycastTarget = false;
+            it.border = it.rt.gameObject.AddComponent<Outline>();
+            it.border.effectColor = BorderIdle;
+            it.border.effectDistance = new Vector2(3, -3);
+            it.border.useGraphicAlpha = false;
+            it.cg = it.rt.gameObject.AddComponent<CanvasGroup>();
+            it.cg.alpha = 1f;
+            it.cg.blocksRaycasts = false;
+
+            it.label = NewText("Label", it.rt, labelText, fontSize, GoldText, TextAnchor.MiddleCenter);
+            it.label.fontStyle = FontStyle.Bold;
+            Stretch(it.label.rectTransform);
+
+            if (showArrows)
+            {
+                float arrowOffset = (size.x * 0.5f) - 45f;
+                it.arrowL = NewText("ArrowL", it.rt, ">", fontSize, Dark, TextAnchor.MiddleCenter);
+                it.arrowL.supportRichText = false;
+                it.arrowL.rectTransform.sizeDelta = new Vector2(60, size.y);
+                it.arrowL.rectTransform.anchoredPosition = new Vector2(-arrowOffset, 0);
+
+                it.arrowR = NewText("ArrowR", it.rt, "<", fontSize, Dark, TextAnchor.MiddleCenter);
+                it.arrowR.supportRichText = false;
+                it.arrowR.rectTransform.sizeDelta = new Vector2(60, size.y);
+                it.arrowR.rectTransform.anchoredPosition = new Vector2(arrowOffset, 0);
+            }
+
+            return it;
+        }
+
         static Sprite MakeVignette()
         {
             const int n = 128;
@@ -236,7 +201,6 @@ namespace MysticKombat
             return 1f - x * x * x;
         }
 
-        // ------------------------------------------------------------- UI
         void BuildUI()
         {
             var canvasGo = new GameObject("MenuCanvas", typeof(RectTransform), typeof(Canvas), typeof(CanvasScaler));
@@ -273,7 +237,6 @@ namespace MysticKombat
             vigImg.sprite = MakeVignette();
             vigImg.raycastTarget = false;
 
-            // title
             var title = NewText("Title", root,
                 "<color=#ff3fd0>MYSTIC</color>\n<color=#ffe27a>KOMBAT</color>",
                 140, Color.white, TextAnchor.MiddleCenter);
@@ -290,50 +253,18 @@ namespace MysticKombat
             titleShadow.effectColor = new Color(0, 0, 0, 0.9f);
             titleShadow.effectDistance = new Vector2(10, -10);
 
-            // menu buttons
             for (int i = 0; i < Labels.Length; i++)
             {
-                var it = new Item();
-                it.baseY = 20f - i * 100f;
-                it.rt = NewRect("Item_" + Labels[i], root);
-                it.rt.sizeDelta = new Vector2(620, 80);
-                it.rt.anchoredPosition = new Vector2(0, it.baseY);
-                it.bg = it.rt.gameObject.AddComponent<Image>();
-                it.bg.color = new Color(0, 0, 0, 0.65f);
-                it.bg.raycastTarget = false;
-                it.border = it.rt.gameObject.AddComponent<Outline>();
-                it.border.effectColor = BorderIdle;
-                it.border.effectDistance = new Vector2(3, -3);
-                it.border.useGraphicAlpha = false;
-                it.cg = it.rt.gameObject.AddComponent<CanvasGroup>();
-                it.cg.alpha = 0f;
-                it.cg.blocksRaycasts = false;
-
-                it.label = NewText("Label", it.rt, Labels[i], 46, GoldText, TextAnchor.MiddleCenter);
-                it.label.fontStyle = FontStyle.Bold;
-                Stretch(it.label.rectTransform);
-
-                it.arrowL = NewText("ArrowL", it.rt, ">", 46, Dark, TextAnchor.MiddleCenter);
-                it.arrowL.supportRichText = false;
-                it.arrowL.rectTransform.sizeDelta = new Vector2(60, 80);
-                it.arrowL.rectTransform.anchoredPosition = new Vector2(-265, 0);
-
-                it.arrowR = NewText("ArrowR", it.rt, "<", 46, Dark, TextAnchor.MiddleCenter);
-                it.arrowR.supportRichText = false;
-                it.arrowR.rectTransform.sizeDelta = new Vector2(60, 80);
-                it.arrowR.rectTransform.anchoredPosition = new Vector2(265, 0);
-
-                items[i] = it;
+                items[i] = CreateStyledButton(Labels[i], root, new Vector2(620, 80), 20f - i * 100f, 46, true);
+                items[i].cg.alpha = 0f;
             }
 
-            // bottom hint
             hint = NewText("Hint", root, "W / S  or  UP / DOWN  to move     ENTER  to select     (mouse works too)",
                 28, new Color(0.8f, 0.9f, 1f, 0.85f), TextAnchor.MiddleCenter);
             hint.supportRichText = false;
             hint.rectTransform.sizeDelta = new Vector2(1600, 50);
             hint.rectTransform.anchoredPosition = new Vector2(0, -470);
 
-            // toast message
             toast = NewText("Toast", root, "", 40, Gold, TextAnchor.MiddleCenter);
             toast.rectTransform.sizeDelta = new Vector2(1600, 60);
             toast.rectTransform.anchoredPosition = new Vector2(0, -400);
@@ -341,32 +272,78 @@ namespace MysticKombat
             toastShadow.effectColor = Color.black;
             toastShadow.effectDistance = new Vector2(3, -3);
 
-            // controls panel
-            controlsPanel = NewRect("ControlsPanel", root);
-            Stretch(controlsPanel);
-            var panelImg = controlsPanel.gameObject.AddComponent<Image>();
-            panelImg.color = new Color(0.02f, 0f, 0.06f, 0.88f);
-            var ctl = NewText("ControlsText", controlsPanel,
-                "<size=90><color=#ff3fd0>CONTROLS</color></size>\n\n" +
-                "<color=#ffe27a>PLAYER 1</color>\n" +
-                "A / D  move      W  jump\n" +
-                "F  punch      G  kick\n" +
-                "R  flying kick      H  block\n\n" +
-                "<color=#ffe27a>PLAYER 2</color>\n" +
-                "LEFT / RIGHT  move      UP  jump\n" +
-                ",  punch      .  kick\n" +
-                "RIGHT SHIFT  flying kick      /  block\n\n" +
-                "<size=30><color=#9fe8ff>Press ENTER or ESC to go back</color></size>",
-                44, Color.white, TextAnchor.MiddleCenter);
-            ctl.rectTransform.sizeDelta = new Vector2(1600, 900);
-            controlsPanel.gameObject.SetActive(false);
-
-            // fade-from-black (last = on top)
+            // fade-from-black (last = on top of main menu)
             var fadeRt = NewRect("Fade", root);
             Stretch(fadeRt);
             fade = fadeRt.gameObject.AddComponent<Image>();
             fade.color = Color.black;
             fade.raycastTarget = false;
+        }
+
+        void BuildPauseUI()
+        {
+            var hudGo = new GameObject("PauseCanvas", typeof(RectTransform), typeof(Canvas), typeof(CanvasScaler));
+            hudGo.transform.SetParent(transform, false);
+            var canvas = hudGo.GetComponent<Canvas>();
+            canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+            canvas.sortingOrder = 200; // Above battle UI and main menu
+            var scaler = hudGo.GetComponent<CanvasScaler>();
+            scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
+            scaler.referenceResolution = new Vector2(1920, 1080);
+            scaler.screenMatchMode = CanvasScaler.ScreenMatchMode.MatchWidthOrHeight;
+            scaler.matchWidthOrHeight = 0.5f;
+            hudRoot = hudGo.GetComponent<RectTransform>();
+
+            pauseTopBtn = CreateStyledButton("PAUSE", hudRoot, new Vector2(210, 58), PauseButtonY, 32, false);
+            pauseTopBtn.rt.anchorMin = new Vector2(0.5f, 1f);
+            pauseTopBtn.rt.anchorMax = new Vector2(0.5f, 1f);
+            pauseTopBtn.rt.pivot = new Vector2(0.5f, 0.5f);
+            pauseTopBtn.rt.anchoredPosition = new Vector2(0f, PauseButtonY);
+
+            pausePanel = NewRect("PausePanel", hudRoot);
+            Stretch(pausePanel);
+            var bg = pausePanel.gameObject.AddComponent<Image>();
+            bg.color = new Color(0.02f, 0f, 0.06f, 0.80f);
+            bg.raycastTarget = false;
+
+            var pauseTitle = NewText("PauseTitle", pausePanel, "<color=#ff3fd0>PAUSED</color>", 110, Color.white, TextAnchor.MiddleCenter);
+            pauseTitle.fontStyle = FontStyle.Bold;
+            pauseTitle.rectTransform.sizeDelta = new Vector2(900, 160);
+            pauseTitle.rectTransform.anchoredPosition = new Vector2(0, 200);
+            var ptGlow = pauseTitle.gameObject.AddComponent<Outline>();
+            ptGlow.effectColor = new Color(Cyan.r, Cyan.g, Cyan.b, 0.8f);
+            ptGlow.effectDistance = new Vector2(4, -4);
+            var ptShadow = pauseTitle.gameObject.AddComponent<Shadow>();
+            ptShadow.effectColor = new Color(0, 0, 0, 0.9f);
+            ptShadow.effectDistance = new Vector2(8, -8);
+
+            for (int i = 0; i < PauseLabels.Length; i++)
+            {
+                pauseItems[i] = CreateStyledButton(PauseLabels[i], pausePanel, new Vector2(620, 80), 20f - i * 100f, 46, true);
+            }
+
+            // Shared Controls / Options panel (placed on hudRoot so it works from both Main Menu and Pause Menu)
+            controlsPanel = NewRect("ControlsPanel", hudRoot);
+            Stretch(controlsPanel);
+            var panelImg = controlsPanel.gameObject.AddComponent<Image>();
+            panelImg.color = new Color(0.02f, 0f, 0.06f, 0.92f);
+            var ctl = NewText("ControlsText", controlsPanel,
+                "<size=90><color=#ff3fd0>OPTIONS & CONTROLS</color></size>\n\n" +
+                "<color=#ffe27a>PLAYER 1</color>\n" +
+                "A / D  move      W  jump\n" +
+                "F  punch      G  kick      T  special\n" +
+                "R  flying kick      H  block\n\n" +
+                "<color=#ffe27a>PLAYER 2</color>\n" +
+                "LEFT / RIGHT  move      UP  jump\n" +
+                ",  punch      .  kick      ;  special\n" +
+                "RIGHT SHIFT  flying kick      /  block\n\n" +
+                "<size=30><color=#9fe8ff>Press ENTER, ESC, or CLICK to go back</color></size>",
+                44, Color.white, TextAnchor.MiddleCenter);
+            ctl.rectTransform.sizeDelta = new Vector2(1600, 900);
+
+            controlsPanel.gameObject.SetActive(false);
+            pausePanel.gameObject.SetActive(false);
+            pauseTopBtn.rt.gameObject.SetActive(false);
         }
 
         void UpdateBackgroundCover()
@@ -389,21 +366,25 @@ namespace MysticKombat
             bgImage.uvRect = uv;
         }
 
-        // --------------------------------------------------------- update
         void Update()
         {
             float dt = Time.unscaledDeltaTime;
             clock += dt;
+
+            if (inBattle)
+            {
+                UpdateBattlePause(dt);
+                return;
+            }
 
             if (!Mathf.Approximately(lastScreenAspect, (float)Screen.width / Mathf.Max(1, Screen.height)))
                 UpdateBackgroundCover();
 
             AnimateBackground();
             AnimateTitle();
-            AnimateItems(dt);
-            HandleInput();
+            AnimateButtonList(items, selected, !controlsOpen, dt, true);
+            HandleMainMenuInput();
 
-            // fade in, toast fade, hint blink
             fade.color = new Color(0, 0, 0, 1f - Mathf.Clamp01(clock / 1.0f));
 
             if (toastT > 0f)
@@ -433,11 +414,9 @@ namespace MysticKombat
             scale *= 1f + 0.012f * Mathf.Sin(clock * 2f);
             titleRt.localScale = new Vector3(scale, scale, 1f);
 
-            // neon glow pulse
             float glow = 0.55f + 0.45f * Mathf.Sin(clock * 2.5f);
             titleGlow.effectColor = new Color(Cyan.r, Cyan.g, Cyan.b, glow);
 
-            // occasional glitch jitter
             if (glitchT <= 0f && Random.value < 0.004f) glitchT = 0.12f;
             float gx = 0f;
             if (glitchT > 0f)
@@ -448,22 +427,28 @@ namespace MysticKombat
             titleRt.anchoredPosition = new Vector2(gx, 285f);
         }
 
-        void AnimateItems(float dt)
+        void AnimateButtonList(Item[] list, int selIndex, bool activeState, float dt, bool slideIntro)
         {
             float pulse = 0.5f + 0.5f * Mathf.Sin(clock * 6f);
 
-            for (int i = 0; i < items.Length; i++)
+            for (int i = 0; i < list.Length; i++)
             {
-                var it = items[i];
+                var it = list[i];
 
-                // slide-in intro
-                float s = Mathf.Clamp01((clock - (0.7f + 0.12f * i)) / 0.45f);
-                float e0 = EaseOutCubic(s);
-                it.cg.alpha = e0;
-                float xOff = (1f - e0) * 700f;
+                float xOff = 0f;
+                if (slideIntro)
+                {
+                    float s = Mathf.Clamp01((clock - (0.7f + 0.12f * i)) / 0.45f);
+                    float e0 = EaseOutCubic(s);
+                    it.cg.alpha = e0;
+                    xOff = (1f - e0) * 700f;
+                }
+                else
+                {
+                    it.cg.alpha = 1f;
+                }
 
-                // selection blend
-                float target = (i == selected && !controlsOpen) ? 1f : 0f;
+                float target = (i == selIndex && activeState) ? 1f : 0f;
                 it.t = Mathf.MoveTowards(it.t, target, dt * 7f);
                 float e = it.t * it.t * (3f - 2f * it.t);
                 it.punch = Mathf.MoveTowards(it.punch, 0f, dt * 4f);
@@ -479,23 +464,40 @@ namespace MysticKombat
                 it.border.effectColor = Color.Lerp(BorderIdle, Cyan, e);
                 it.border.effectDistance = Vector2.Lerp(new Vector2(3, -3), new Vector2(5, -5), e);
 
-                float sc = 1f + 0.10f * e + 0.06f * it.punch;
-                it.rt.localScale = new Vector3(sc, sc, 1f);
-                it.rt.anchoredPosition = new Vector2(xOff + 22f * e, it.baseY);
+                // Fixed scale and aligned X position (no magnification on hover/selection)
+                it.rt.localScale = Vector3.one;
+                it.rt.anchoredPosition = new Vector2(xOff, it.baseY);
 
-                // blinking arrows
-                float wob = Mathf.Sin(clock * 10f);
-                float a = e * (0.6f + 0.4f * wob);
-                var ac = Dark; ac.a = a;
-                it.arrowL.color = ac;
-                it.arrowR.color = ac;
-                it.arrowL.rectTransform.anchoredPosition = new Vector2(-265f + 6f * wob, 0f);
-                it.arrowR.rectTransform.anchoredPosition = new Vector2(265f - 6f * wob, 0f);
+                if (it.arrowL != null && it.arrowR != null)
+                {
+                    float wob = Mathf.Sin(clock * 10f);
+                    float a = e * (0.6f + 0.4f * wob);
+                    var ac = Dark; ac.a = a;
+                    it.arrowL.color = ac;
+                    it.arrowR.color = ac;
+                    it.arrowL.rectTransform.anchoredPosition = new Vector2(-265f + 6f * wob, 0f);
+                    it.arrowR.rectTransform.anchoredPosition = new Vector2(265f - 6f * wob, 0f);
+                }
             }
         }
 
-        // ---------------------------------------------------------- input
-        void HandleInput()
+        void AnimateTopPauseButton(float dt)
+        {
+            Vector2 mp = MenuInput.MousePos();
+            bool hovered = RectTransformUtility.RectangleContainsScreenPoint(pauseTopBtn.rt, mp, null);
+            float target = (hovered || pauseOpen) ? 1f : 0f;
+            pauseTopBtn.t = Mathf.MoveTowards(pauseTopBtn.t, target, dt * 8f);
+            float e = pauseTopBtn.t * pauseTopBtn.t * (3f - 2f * pauseTopBtn.t);
+
+            float pulse = 0.5f + 0.5f * Mathf.Sin(clock * 6f);
+            pauseTopBtn.bg.color = Color.Lerp(new Color(0, 0, 0, 0.65f), Color.Lerp(Gold, GoldLight, pulse * 0.5f), e);
+            pauseTopBtn.label.color = Color.Lerp(GoldText, Dark, e);
+            pauseTopBtn.border.effectColor = Color.Lerp(BorderIdle, Cyan, e);
+            pauseTopBtn.border.effectDistance = Vector2.Lerp(new Vector2(3, -3), new Vector2(4, -4), e);
+            pauseTopBtn.rt.localScale = Vector3.one;
+        }
+
+        void HandleMainMenuInput()
         {
             if (busy) return;
 
@@ -505,12 +507,11 @@ namespace MysticKombat
                 return;
             }
 
-            if (MenuInput.Up()) Select((selected - 1 + items.Length) % items.Length);
-            if (MenuInput.Down()) Select((selected + 1) % items.Length);
+            if (MenuInput.Up()) Select(items, ref selected, (selected - 1 + items.Length) % items.Length);
+            if (MenuInput.Down()) Select(items, ref selected, (selected + 1) % items.Length);
 
-            if (MenuInput.Confirm()) Activate(selected);
+            if (MenuInput.Confirm()) ActivateMainMenu(selected);
 
-            // mouse hover (only when the mouse actually moved, so keyboard isn't overridden)
             Vector2 mp = MenuInput.MousePos();
             if ((mp - lastMouse).sqrMagnitude > 0.5f)
             {
@@ -519,7 +520,7 @@ namespace MysticKombat
                 {
                     if (RectTransformUtility.RectangleContainsScreenPoint(items[i].rt, mp, null))
                     {
-                        if (selected != i) Select(i);
+                        if (selected != i) Select(items, ref selected, i);
                         break;
                     }
                 }
@@ -531,22 +532,142 @@ namespace MysticKombat
                 {
                     if (RectTransformUtility.RectangleContainsScreenPoint(items[i].rt, mp, null))
                     {
-                        if (selected != i) Select(i);
-                        Activate(i);
+                        if (selected != i) Select(items, ref selected, i);
+                        ActivateMainMenu(i);
                         break;
                     }
                 }
             }
         }
 
-        void Select(int i)
+        void UpdateBattlePause(float dt)
         {
-            selected = i;
-            items[i].punch = 1f;
+            AnimateTopPauseButton(dt);
+
+            if (controlsOpen)
+            {
+                if (MenuInput.Confirm() || MenuInput.Back() || MenuInput.Click()) CloseControls();
+                return;
+            }
+
+            Vector2 mp = MenuInput.MousePos();
+            bool topPauseClicked = MenuInput.Click() &&
+                                   RectTransformUtility.RectangleContainsScreenPoint(pauseTopBtn.rt, mp, null);
+
+            if (topPauseClicked)
+            {
+                TogglePause(!pauseOpen);
+                return;
+            }
+
+            if (!pauseOpen)
+            {
+                if (MenuInput.Back()) TogglePause(true);
+                return;
+            }
+
+            AnimateButtonList(pauseItems, pauseSelected, true, dt, false);
+
+            if (MenuInput.Back())
+            {
+                TogglePause(false);
+                return;
+            }
+
+            if (MenuInput.Up()) Select(pauseItems, ref pauseSelected, (pauseSelected - 1 + pauseItems.Length) % pauseItems.Length);
+            if (MenuInput.Down()) Select(pauseItems, ref pauseSelected, (pauseSelected + 1) % pauseItems.Length);
+
+            if (MenuInput.Confirm())
+            {
+                ActivatePauseItem(pauseSelected);
+                return;
+            }
+
+            if ((mp - lastMouse).sqrMagnitude > 0.5f)
+            {
+                lastMouse = mp;
+                for (int i = 0; i < pauseItems.Length; i++)
+                {
+                    if (RectTransformUtility.RectangleContainsScreenPoint(pauseItems[i].rt, mp, null))
+                    {
+                        if (pauseSelected != i) Select(pauseItems, ref pauseSelected, i);
+                        break;
+                    }
+                }
+            }
+
+            if (MenuInput.Click())
+            {
+                for (int i = 0; i < pauseItems.Length; i++)
+                {
+                    if (RectTransformUtility.RectangleContainsScreenPoint(pauseItems[i].rt, mp, null))
+                    {
+                        if (pauseSelected != i) Select(pauseItems, ref pauseSelected, i);
+                        ActivatePauseItem(i);
+                        break;
+                    }
+                }
+            }
+        }
+
+        void TogglePause(bool open)
+        {
+            pauseOpen = open;
+            pauseSelected = 0;
+            pausePanel.gameObject.SetActive(open);
+            Time.timeScale = open ? 0f : 1f;
+            Play(open ? sndConfirm : sndMove);
+            lastMouse = MenuInput.MousePos();
+        }
+
+        void ActivatePauseItem(int index)
+        {
+            Play(sndConfirm);
+            pauseItems[index].flash = 0.25f;
+
+            if (index == 0)
+            {
+                OpenControls();
+            }
+            else if (index == 1)
+            {
+                ExitBattleToMainMenu();
+            }
+        }
+
+        void ExitBattleToMainMenu()
+        {
+            Time.timeScale = 1f;
+            pauseOpen = false;
+            pausePanel.gameObject.SetActive(false);
+            pauseTopBtn.rt.gameObject.SetActive(false);
+
+            // Clean up active BattleScene object if present
+            var battleObj = FindObjectOfType<BattleScene>();
+            if (battleObj != null)
+            {
+                // Try invoking a cleanup method if BattleScene defines one, then destroy its GameObject
+                var m = typeof(BattleScene).GetMethod("Cleanup", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                     ?? typeof(BattleScene).GetMethod("End", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (m != null && m.GetParameters().Length == 0)
+                {
+                    try { m.Invoke(battleObj, null); } catch { }
+                }
+                if (battleObj != null && battleObj.gameObject != null)
+                    Destroy(battleObj.gameObject);
+            }
+
+            ReturnToMenu();
+        }
+
+        void Select(Item[] list, ref int currentSelection, int i)
+        {
+            currentSelection = i;
+            list[i].punch = 1f;
             Play(sndMove);
         }
 
-        void Activate(int i)
+        void ActivateMainMenu(int i)
         {
             if (busy) return;
             busy = true;
@@ -563,12 +684,10 @@ namespace MysticKombat
             switch (i)
             {
                 case 0:
-                    ShowToast("1 PLAYER  -  FIGHT!");
-                    // Later: UnityEngine.SceneManagement.SceneManager.LoadScene("Fight");
+                    StartBattle(false);
                     break;
                 case 1:
-                    ShowToast("2 PLAYERS  -  FIGHT!");
-                    // Later: UnityEngine.SceneManagement.SceneManager.LoadScene("Fight");
+                    StartBattle(true);
                     break;
                 case 2:
                     OpenControls();
@@ -581,6 +700,35 @@ namespace MysticKombat
 #endif
                     break;
             }
+        }
+
+        // Hides the menu and enters the battle screen (see BattleScene.cs).
+        void StartBattle(bool twoPlayers)
+        {
+            root.gameObject.SetActive(false);
+            inBattle = true;
+            pauseOpen = false;
+            pausePanel.gameObject.SetActive(false);
+            pauseTopBtn.rt.gameObject.SetActive(true);
+            Time.timeScale = 1f;
+            BattleScene.Begin(font, twoPlayers, ReturnToMenu);
+        }
+
+        // Called when exiting battle back to the main menu.
+        void ReturnToMenu()
+        {
+            Time.timeScale = 1f;
+            inBattle = false;
+            pauseOpen = false;
+            controlsOpen = false;
+            controlsPanel.gameObject.SetActive(false);
+            pausePanel.gameObject.SetActive(false);
+            pauseTopBtn.rt.gameObject.SetActive(false);
+
+            root.gameObject.SetActive(true);
+            clock = 0f;                                 // replay the menu intro
+            busy = false;
+            lastMouse = MenuInput.MousePos();
         }
 
         void OpenControls()
